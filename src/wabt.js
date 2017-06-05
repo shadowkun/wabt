@@ -113,19 +113,19 @@ OutputBuffer.prototype.destroy = function() {
 };
 
 
-/// ErrorHandler
-function ErrorHandler() {
+/// SourceErrorHandler
+function SourceErrorHandler() {
   this.addr = Module._wabt_new_source_error_handler_buffer();
 }
-ErrorHandler.prototype = Object.create(Object.prototype);
+SourceErrorHandler.prototype = Object.create(Object.prototype);
 
-ErrorHandler.prototype.getMessage = function() {
+SourceErrorHandler.prototype.getMessage = function() {
   var addr = Module._wabt_source_error_handler_buffer_get_data(this.addr);
   var size = Module._wabt_source_error_handler_buffer_get_size(this.addr);
   return Module.Pointer_stringify(addr, size);
 }
 
-ErrorHandler.prototype.destroy = function() {
+SourceErrorHandler.prototype.destroy = function() {
   Module._wabt_destroy_source_error_handler_buffer(this.addr);
 };
 
@@ -133,7 +133,7 @@ ErrorHandler.prototype.destroy = function() {
 /// parseWast
 function parseWast(filename, buffer) {
   var lexer = new Lexer(filename, buffer);
-  var errorHandler = new ErrorHandler();
+  var errorHandler = new SourceErrorHandler();
 
   try {
     var parseResult_addr =
@@ -160,6 +160,34 @@ function parseWast(filename, buffer) {
 }
 
 
+// readWasm
+function readWasm(buffer, options) {
+  var bufferObj = allocateBuffer(buffer);
+  var errorHandler = new BinaryErrorHandler();
+  var read_debug_names = options.read_debug_names || true;
+
+  try {
+    var readWasmResult_addr =
+        Module._wabt_read_binary(buffer.addr, buffer.size, read_debug_names);
+
+    var result =
+        Module._wabt_read_binary_result_get_result(readWasmResult_addr);
+    if (result !== WABT_OK) {
+      throw new Error('readWasm failed:\n' + errorHandler.getMessage());
+    }
+
+    var module_addr =
+        Module._wabt_read_binary_result_release_module(readWasmResult_addr);
+    var result = new Module(module_addr);
+    return result;
+  } finally {
+    Module._wabt_destroy_read_binary_result(readWasmResult_addr);
+    errorHandler.destroy();
+    Module._free(bufferObj.addr);
+  }
+}
+
+
 /// Script
 function Script(lexer, script_addr) {
   this.lexer = lexer;
@@ -168,7 +196,7 @@ function Script(lexer, script_addr) {
 Script.prototype = Object.create(Object.prototype);
 
 Script.prototype.resolveNames = function() {
-  var errorHandler = new ErrorHandler();
+  var errorHandler = new SourceErrorHandler();
   try {
     var result = Module._wabt_resolve_names_script(
         this.lexer.addr, this.script_addr, errorHandler.addr);
@@ -181,7 +209,7 @@ Script.prototype.resolveNames = function() {
 };
 
 Script.prototype.validate = function() {
-  var errorHandler = new ErrorHandler();
+  var errorHandler = new SourceErrorHandler();
   try {
     var result = Module._wabt_validate_script(this.lexer.addr, this.script_addr,
                                               errorHandler.addr);
@@ -194,32 +222,86 @@ Script.prototype.validate = function() {
 };
 
 Script.prototype.toBinary = function(options) {
+  var module_addr = Module._wabt_get_first_module(this.script_addr);
+  var module = new Module(module_addr);
+  return module.toBinary(options);
+};
+
+Script.prototype.destroy = function() {
+  Module._wabt_destroy_script(this.script_addr);
+  this.lexer.destroy();
+};
+
+
+// Module
+function Module(module_addr) {
+  this.module_addr = module_addr;
+}
+Module.prototype = Object.create(Object.prototype);
+
+Module.prototype.generateNames = function() {
+  var result = Module._wabt_generate_names_module(this.module_addr);
+  if (result !== WABT_OK) {
+    throw new Error('generateNames failed.');
+  }
+};
+
+Module.prototype.toWat = function(options) {
+  var fold_exprs = options.fold_exprs || false;
+  var inline_export = options.inline_export || false;
+
+  var writeModuleResult_addr = Module._wabt_write_text_module(
+      this.module_addr, fold_exprs, inline_export);
+
+  var result =
+      Module._wabt_write_module_result_get_result(writeModuleResult_addr);
+
+  try {
+    if (result !== WABT_OK) {
+      throw new Error('toWat failed.');
+    }
+
+    var outputBuffer = new OutputBuffer(
+        Module._wabt_write_module_result_release_binary_output_buffer(
+            writeModuleResult_addr));
+
+    return outputBuffer.toTypedArray();
+
+  } finally {
+    if (outptuBuffer) {
+      outptuBuffer.destroy();
+    }
+    Module._wabt_destroy_write_module_result(writeModuleResult_addr);
+  }
+};
+
+Module.prototype.toBinary = function(options) {
   var log = options.log || false;
   var canonicalize_lebs = options.canonicalize_lebs || true;
   var relocatable = options.relocatable || false;
   var write_debug_names = options.write_debug_names || false;
 
-  var writeBinaryResult_addr = Module._wabt_write_binary_module(
-      this.script_addr, log, canonicalize_lebs, relocatable, write_debug_names);
+  var writeModuleResult_addr = Module._wabt_write_binary_module(
+      this.module_addr, log, canonicalize_lebs, relocatable, write_debug_names);
 
-  var result = Module._wabt_write_binary_module_result_get_result(
-      writeBinaryResult_addr);
+  var result =
+      Module._wabt_write_module_result_get_result(writeModuleResult_addr);
 
   try {
     if (result !== WABT_OK) {
-      throw new Error('writeBinaryModule failed.');
+      throw new Error('toBinary failed.');
     }
 
     var binaryOutputBuffer = new OutputBuffer(
-        Module._wabt_write_binary_module_result_release_binary_output_buffer(
-            writeBinaryResult_addr));
+        Module._wabt_write_module_result_release_binary_output_buffer(
+            writeModuleResult_addr));
     var logOutputBuffer = new OutputBuffer(
-        Module._wabt_write_binary_module_result_release_log_output_buffer(
-            writeBinaryResult_addr));
+        Module._wabt_write_module_result_release_log_output_buffer(
+            writeModuleResult_addr));
 
     return {
-      buffer : binaryOutputBuffer.toTypedArray(),
-      log : logOutputBuffer.toString()
+      buffer: binaryOutputBuffer.toTypedArray(),
+      log: logOutputBuffer.toString()
     };
 
   } finally {
@@ -229,16 +311,16 @@ Script.prototype.toBinary = function(options) {
     if (logOutputBuffer) {
       logOutputBuffer.destroy();
     }
-    Module._wabt_destroy_write_binary_module_result(writeBinaryResult_addr);
+    Module._wabt_destroy_write_module_result(writeModuleResult_addr);
   }
 };
 
-Script.prototype.destroy = function() {
-  Module._wabt_destroy_script(this.script_addr);
-  this.lexer.destroy();
+Module.prototype.destroy = function() {
+  Module._wabt_destroy_module(this.module_addr);
 };
 
 wabt.ready = Promise.resolve();
 wabt.parseWast = parseWast;
+wabt.readWasm = readWasm;
 
 })(wabt);
